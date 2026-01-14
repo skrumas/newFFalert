@@ -2,7 +2,7 @@ name: Prisync Scraper Bot
 
 on:
   schedule:
-    - cron: '*/10 * * * *'  # Her 10 dakikada bir çalış
+    - cron: '*/5 * * * *'  # Her 10 dakikada bir çalış
   workflow_dispatch:      # Manuel tetikleme butonu ekler
 
 jobs:
