@@ -2,8 +2,14 @@ name: Prisync Scraper Bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # Her 10 dakikada bir çalış
-  workflow_dispatch:      # Manuel tetikleme butonu ekler
+    - cron: '*/6 * * * *'  # 6 dakikada bir çalış
+  workflow_dispatch:      # Manuel buton
+
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 
 jobs:
   scrape:
