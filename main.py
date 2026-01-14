@@ -9,7 +9,6 @@ from google.oauth2.service_account import Credentials
 import re
 
 # --- Configuration ---
-# Artık dosya yolları yok, her şey Environment Variable'dan gelecek.
 PRISYNC_SITELIST_URL_TEMPLATE = "https://prisync.me/admin/fetchField/siteList/Site_page/{}/Site_sort/id.desc"
 SPREADSHEET_NAME = 'New FF Alert'
 
@@ -35,7 +34,6 @@ class GoogleSheetsManager:
                 'https://www.googleapis.com/auth/spreadsheets',
                 'https://www.googleapis.com/auth/drive'
             ]
-            # GitHub Secret'tan gelen JSON verisini okuyoruz
             json_creds = json.loads(os.environ["GSPREAD_JSON"])
             creds = Credentials.from_service_account_info(json_creds, scopes=scopes)
             self.client = gspread.authorize(creds)
@@ -58,22 +56,38 @@ class GoogleSheetsManager:
 
     def _load_existing_ids(self):
         try:
+            # Sadece A sütununu (ID'leri) çekiyoruz
             col_a_values = self.sheet.col_values(1)
+            
             for val in col_a_values:
+                # --- KRİTİK DÜZELTME BAŞLANGICI ---
+                # Gelen veriyi önce stringe çevir, boşlukları sil
                 val_str = str(val).strip()
+                
+                # Eğer boşsa atla
+                if not val_str:
+                    continue
+
+                # Eğer "361564716.0" gibi geldiyse, sondaki .0'ı sil
+                if val_str.endswith(".0"):
+                    val_str = val_str[:-2]
+                
+                # Sadece sayısal kısımları al (Garanti olsun)
                 if val_str.isdigit():
                     self.existing_ids.add(val_str)
                 else:
+                    # Eski URL formatındaysa ID'yi ayıkla
                     match = re.search(r'site_id=(\d+)', val_str)
                     if match:
                         self.existing_ids.add(match.group(1))
-            logger.info(f"Loaded {len(self.existing_ids)} existing IDs.")
+                # --- KRİTİK DÜZELTME BİTİŞİ ---
+
+            logger.info(f"Loaded {len(self.existing_ids)} existing IDs (Cleaned).")
         except Exception as e:
             logger.error(f"Error loading existing IDs: {e}")
 
 class AsyncScraper:
     def __init__(self):
-        # Cookie stringini direkt GitHub Secret'tan alıp parse ediyoruz
         raw_cookie = os.environ.get("PRISYNC_COOKIE", "")
         self.cookies = {}
         if raw_cookie:
@@ -112,7 +126,7 @@ class AsyncScraper:
                 cols = row.find_all("td")
                 if len(cols) >= 3:
                     seller_name = cols[2].get_text(strip=True)
-                    if not seller_name: # Boş satıcı (Fetch Field)
+                    if not seller_name: 
                         site_id = cols[0].get_text(strip=True)
                         site_url = cols[1].get_text(strip=True)
                         data.append({"ID": site_id, "Site": site_url})
@@ -166,26 +180,24 @@ class SlackNotifier:
             logger.error(f"Slack error: {e}")
 
 async def main():
-    # 1. Google Sheets Başlat
     sheets_manager = GoogleSheetsManager(SPREADSHEET_NAME)
     try:
         sheets_manager.connect()
     except Exception:
         return 
 
-    # 2. Scrape İşlemi (Seleniumsuz)
     logger.info("Starting scrape cycle...")
     scraper = AsyncScraper()
     found_sites = await scraper.run()
     logger.info(f"Scrape finished. Found {len(found_sites)} candidates.")
 
-    # 3. Filtreleme ve Kayıt
     new_unique_sites = []
     if found_sites:
         found_sites.sort(key=lambda x: int(x['ID']) if str(x['ID']).isdigit() else 0, reverse=True)
         rows_to_add = []
         for item in found_sites:
             site_id = str(item['ID']).strip()
+            # Buradaki karşılaştırma artık daha güvenli
             if site_id not in sheets_manager.existing_ids:
                 link = f"https://prisync.me/admin/fetchField/site?site_id={site_id}"
                 row = [site_id, item['Site'], link]
@@ -200,7 +212,6 @@ async def main():
             except Exception as e:
                 logger.error(f"Sheets error: {e}")
 
-    # 4. Slack Bildirimi
     if new_unique_sites:
         slack = SlackNotifier()
         await slack.send_notification(new_unique_sites)
