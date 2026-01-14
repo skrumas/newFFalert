@@ -1,0 +1,29 @@
+name: Prisync Scraper Bot
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Her 5 dakikada bir çalış
+  workflow_dispatch:      # Manuel tetikleme butonu ekler
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodu Çek
+        uses: actions/checkout@v3
+
+      - name: Python Kur
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Kütüphaneleri Yükle
+        run: |
+          pip install aiohttp pandas beautifulsoup4 gspread google-auth lxml
+
+      - name: Scripti Çalıştır
+        env:
+          PRISYNC_COOKIE: ${{ secrets.PRISYNC_COOKIE }}
+          GSPREAD_JSON: ${{ secrets.GSPREAD_JSON }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: python main.py
