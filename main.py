@@ -4,10 +4,9 @@ import aiohttp
 import json
 import logging
 import gspread
-import pandas as pd
-from gspread_dataframe import set_with_dataframe, get_as_dataframe
 from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
+import re
 
 # --- Configuration ---
 PRISYNC_SITELIST_URL_TEMPLATE = "https://prisync.me/admin/fetchField/siteList/Site_page/{}/Site_sort/id.desc"
@@ -27,6 +26,7 @@ class GoogleSheetsManager:
         self.spreadsheet_name = spreadsheet_name
         self.client = None
         self.sheet = None
+        self.existing_ids = set()
 
     def connect(self):
         try:
@@ -39,58 +39,82 @@ class GoogleSheetsManager:
             self.client = gspread.authorize(creds)
             self.sheet = self.client.open(self.spreadsheet_name).get_worksheet(0)
             logger.info("Connected to Google Sheets successfully.")
+            
+            # Başlık kontrolü (Sadece yoksa ekler, varsa dokunmaz)
+            self._ensure_headers()
+            
+            # Mevcut ID'leri yükle
+            self._load_existing_ids()
         except Exception as e:
             logger.critical(f"Failed to connect to Google Sheets: {e}")
             raise
 
-    def get_existing_data(self):
-        """Mevcut veriyi Pandas DataFrame olarak çeker ve temizler"""
+    def _ensure_headers(self):
         try:
-            # Sayfadaki her şeyi DataFrame olarak al
-            df = get_as_dataframe(self.sheet, evaluate_formulas=True)
-            
-            # Tamamen boş satırları sil
-            df = df.dropna(how='all')
-            
-            # 'site_id' sütunu yoksa oluştur (boş df ise)
-            if 'site_id' not in df.columns:
-                df = pd.DataFrame(columns=['site_id', 'URL', 'ff_site'])
-            
-            # ID'leri stringe çevir ve ".0" gibi küsuratları temizle
-            df['site_id'] = df['site_id'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
-            
-            # "site_id" yazan başlık satırı veriye karıştıysa temizle
-            df = df[df['site_id'] != 'site_id']
-            
-            # Kopya kayıtları sil (Eskiden kalanlar varsa temizlenir)
-            df = df.drop_duplicates(subset=['site_id'], keep='first')
-            
-            logger.info(f"Loaded {len(df)} unique rows from sheet.")
-            return df
+            headers = self.sheet.row_values(1)
+            # Eğer sayfa boşsa başlık ekle, değilse dokunma
+            if not headers:
+                logger.info("Sheet is empty. Adding headers...")
+                # Checkbox sütunu için başlık da ekleyelim
+                self.sheet.insert_row(["site_id", "URL", "ff_site", "done or not"], index=1)
         except Exception as e:
-            logger.error(f"Error reading sheet: {e}")
-            return pd.DataFrame(columns=['site_id', 'URL', 'ff_site'])
+            logger.error(f"Error checking headers: {e}")
 
-    def overwrite_sheet(self, df_final):
-        """Temizlenmiş ve birleştirilmiş veriyi sayfaya yazar"""
+    def _load_existing_ids(self):
+        """
+        MEVCUT DÜZENİ BOZMADAN OKUMA:
+        Sadece A sütunundaki ID'leri okur. Senin Checkboxlarına dokunmaz.
+        Regex kullanarak "361564.0", "361564" veya metin formatındaki ID'leri
+        tek bir formata (saf sayı stringi) çevirip hafızaya alır.
+        """
         try:
-            # Yazmadan önce tekrar son bir duplicate kontrolü yap
-            df_final = df_final.drop_duplicates(subset=['site_id'], keep='first')
+            # Sadece 1. sütunu (ID) çekiyoruz. Diğer sütunlar (Checkbox vs) umurumuzda değil.
+            col_a_values = self.sheet.col_values(1)
             
-            # ID'lere göre sırala (En yeni en üstte veya ID'ye göre)
-            # İstersen burayı kapatabilirsin, şu an ID'si büyük olanı en üste alır.
-            # Sayısal sıralama için geçici çevirim
-            df_final['temp_id'] = pd.to_numeric(df_final['site_id'], errors='coerce')
-            df_final = df_final.sort_values(by='temp_id', ascending=False).drop(columns=['temp_id'])
-            
-            # Sayfayı temizle
-            self.sheet.clear()
-            
-            # Yeni veriyi yaz
-            set_with_dataframe(self.sheet, df_final)
-            logger.info(f"Successfully overwrote sheet with {len(df_final)} unique rows.")
+            # Başlığı atla
+            if col_a_values:
+                col_a_values = col_a_values[1:]
+
+            count = 0
+            for val in col_a_values:
+                raw_val = str(val).strip()
+                if not raw_val: continue
+
+                # --- REGEX İLE SAF ID ÇIKARMA ---
+                # Ne gelirse gelsin (123.0, 123, site_id=123) içindeki sayıyı alır.
+                match = re.search(r'(\d+)', raw_val.replace(",", "").replace(".", ""))
+                
+                if match:
+                    # Bulduğu sayıyı hafızaya atar
+                    clean_id = match.group(1)
+                    # Çok önemli: Prisync ID'leri genelde 9 hanelidir. 
+                    # 123.0 gibi durumlarda sondaki 0'ı ID sanmaması için basit bir kontrol:
+                    # Ancak regex .replace(".", "") yaptığımız için 1230 olur.
+                    # Daha güvenli yöntem: float -> int -> str
+                    try:
+                        clean_id = str(int(float(raw_val)))
+                    except:
+                        pass # Regex sonucu zaten clean_id idi
+                    
+                    self.existing_ids.add(clean_id)
+                    count += 1
+
+            logger.info(f"✅ Loaded {len(self.existing_ids)} unique existing IDs (Scanning existing rows).")
         except Exception as e:
-            logger.error(f"Error overwriting sheet: {e}")
+            logger.error(f"Error loading existing IDs: {e}")
+
+    def append_new_sites(self, rows_to_add):
+        """
+        Sadece yeni verileri EN ALTA ekler.
+        Mevcut satırlara, checkboxlara ASLA dokunmaz.
+        """
+        if rows_to_add:
+            try:
+                # append_rows fonksiyonu mevcut verinin en altına ekleme yapar.
+                self.sheet.append_rows(rows_to_add)
+                logger.info(f"✅ Appended {len(rows_to_add)} new rows to the bottom.")
+            except Exception as e:
+                logger.error(f"Error appending rows: {e}")
 
 class AsyncScraper:
     def __init__(self):
@@ -117,10 +141,8 @@ class AsyncScraper:
                     return await response.text()
                 elif response.status == 302:
                     logger.warning(f"Page {page_num} redirected. COOKIE MIGHT BE EXPIRED!")
-                else:
-                    logger.warning(f"Page {page_num} failed: {response.status}")
-        except Exception as e:
-            logger.error(f"Error fetching page {page_num}: {e}")
+        except Exception:
+            pass
         return None
 
     def parse_html(self, html):
@@ -135,7 +157,7 @@ class AsyncScraper:
                     if not seller_name: 
                         site_id = cols[0].get_text(strip=True)
                         site_url = cols[1].get_text(strip=True)
-                        data.append({"site_id": site_id, "URL": site_url})
+                        data.append({"ID": site_id, "Site": site_url})
         except Exception:
             pass
         return data
@@ -164,26 +186,26 @@ class AsyncScraper:
                 tasks.append(task)
             await queue.join()
             for task in tasks: task.cancel()
-        
         return self.results
 
 class SlackNotifier:
     def __init__(self):
         self.webhook_url = os.environ.get("SLACK_WEBHOOK")
 
-    async def send_notification(self, new_sites_df):
-        if not self.webhook_url or new_sites_df.empty: return
+    async def send_notification(self, new_rows):
+        if not self.webhook_url or not new_rows: return
         try:
-            # Sadece ilk 15 siteyi bildir (Spam olmaması için)
-            sites_to_show = new_sites_df.head(15)
-            count = len(new_sites_df)
+            # new_rows format: [site_id, url, link]
+            count = len(new_rows)
+            # İlk 10 taneyi göster
+            display_rows = new_rows[:10]
             
-            message_text = f"🚨 *{count} Yeni Site Bulundu!* 🚨\n\n"
-            for _, row in sites_to_show.iterrows():
-                message_text += f"• *{row['URL']}* (ID: {row['site_id']})\n  <{row['ff_site']}|Prisync Linki>\n"
+            message_text = f"🚨 *{count} Yeni Site Bulundu!* (Sona Eklendi) 🚨\n\n"
+            for row in display_rows:
+                message_text += f"• *{row[1]}* (ID: {row[0]})\n  <{row[2]}|Prisync Linki>\n"
             
-            if count > 15:
-                message_text += f"\n... ve {count - 15} site daha."
+            if count > 10:
+                message_text += f"\n... ve {count - 10} site daha."
 
             connector = aiohttp.TCPConnector(ssl=False)
             async with aiohttp.ClientSession(connector=connector) as session:
@@ -193,55 +215,46 @@ class SlackNotifier:
             logger.error(f"Slack error: {e}")
 
 async def main():
-    # 1. Google Sheets Bağlantısı
+    # 1. Google Sheets Başlat
     sheets_manager = GoogleSheetsManager(SPREADSHEET_NAME)
     try:
         sheets_manager.connect()
     except Exception:
         return 
 
-    # 2. Mevcut Veriyi Çek ve Temizle (Eski kopyaları da temizler)
-    df_existing = sheets_manager.get_existing_data()
-    existing_ids_set = set(df_existing['site_id'].tolist())
-
-    # 3. Scrape İşlemi
+    # 2. Scrape İşlemi
     logger.info("Starting scrape cycle...")
     scraper = AsyncScraper()
-    found_sites_list = await scraper.run() # List of dicts
-    logger.info(f"Scrape finished. Found {len(found_sites_list)} candidates.")
+    found_sites = await scraper.run()
+    logger.info(f"Scrape finished. Found {len(found_sites)} candidates.")
 
-    # 4. Yeni Veriyi DataFrame'e Çevir
-    if not found_sites_list:
-        logger.info("No sites found in scrape.")
-        return
-
-    df_found = pd.DataFrame(found_sites_list)
-    # Link sütununu oluştur
-    df_found['ff_site'] = df_found['site_id'].apply(lambda x: f"https://prisync.me/admin/fetchField/site?site_id={x}")
+    # 3. Filtreleme (Duplicate Killer)
+    rows_to_add = []
     
-    # 5. Sadece GERÇEKTEN yeni olanları ayıkla (Slack için)
-    # df_found içindeki ID'lerden, existing_ids_set içinde OLMAYANLARI bul
-    df_new_unique = df_found[~df_found['site_id'].isin(existing_ids_set)].copy()
-    
-    # Kendi içinde duplicate varsa temizle (aynı turda 2 kere çekildiyse)
-    df_new_unique = df_new_unique.drop_duplicates(subset=['site_id'])
+    # Prisync'ten gelenler ID'ye göre tersten (büyükten küçüğe) gelir genelde.
+    # Ama biz Sheet'in sonuna ekleyeceğimiz için sıralama çok dert değil.
+    # Yine de düzenli olsun diye ID'ye göre sıralayabiliriz.
+    found_sites.sort(key=lambda x: int(x['ID']) if str(x['ID']).isdigit() else 0, reverse=False)
 
-    if not df_new_unique.empty:
-        logger.info(f"Found {len(df_new_unique)} TRULY new sites.")
+    for item in found_sites:
+        site_id = str(item['ID']).strip()
         
-        # 6. Eskilerle Yenileri Birleştir
-        df_final = pd.concat([df_existing, df_new_unique], ignore_index=True)
+        # --- KRİTİK KONTROL ---
+        # Bot, sadece sheets_manager.existing_ids içinde OLMAYANLARI alır.
+        if site_id not in sheets_manager.existing_ids:
+            link = f"https://prisync.me/admin/fetchField/site?site_id={site_id}"
+            # [ID, URL, Link] formatında satır hazırla.
+            # Checkbox sütunu (D) boş kalacak, sen sonra tik atacaksın.
+            row = [site_id, item['Site'], link]
+            rows_to_add.append(row)
+            
+            # Aynı döngüde tekrar eklememek için hafızaya da ekle
+            sheets_manager.existing_ids.add(site_id)
+
+    # 4. Kaydetme ve Bildirim
+    if rows_to_add:
+        # Sadece yeni satırları EN ALTA ekle (Mevcutlara dokunma!)
+        sheets_manager.append_new_sites(rows_to_add)
         
-        # 7. Sayfayı tamamen sil ve yeniden yaz (Overwrite)
-        sheets_manager.overwrite_sheet(df_final)
-        
-        # 8. Slack Bildirimi
+        # Slack'e bildir
         slack = SlackNotifier()
-        await slack.send_notification(df_new_unique)
-    else:
-        # Eğer yeni site yoksa ama eskilerde duplicate varsa temizlemek için yine de yazabilirsin
-        # İsteğe bağlı: sheets_manager.overwrite_sheet(df_existing)
-        logger.info("No new unique sites to add.")
-
-if __name__ == "__main__":
-    asyncio.run(main())
