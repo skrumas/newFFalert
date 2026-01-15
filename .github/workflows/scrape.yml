@@ -25,7 +25,7 @@ jobs:
 
       - name: Kütüphaneleri Yükle
         run: |
-          pip install aiohttp pandas beautifulsoup4 gspread google-auth lxml
+          pip install aiohttp pandas beautifulsoup4 gspread google-auth lxml gspread-dataframe
 
       - name: Scripti Çalıştır
         env:
