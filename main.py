@@ -39,11 +39,7 @@ class GoogleSheetsManager:
             self.client = gspread.authorize(creds)
             self.sheet = self.client.open(self.spreadsheet_name).get_worksheet(0)
             logger.info("Connected to Google Sheets successfully.")
-            
-            # Başlık kontrolü (Sadece yoksa ekler, varsa dokunmaz)
             self._ensure_headers()
-            
-            # Mevcut ID'leri yükle
             self._load_existing_ids()
         except Exception as e:
             logger.critical(f"Failed to connect to Google Sheets: {e}")
@@ -52,69 +48,56 @@ class GoogleSheetsManager:
     def _ensure_headers(self):
         try:
             headers = self.sheet.row_values(1)
-            # Eğer sayfa boşsa başlık ekle, değilse dokunma
-            if not headers:
-                logger.info("Sheet is empty. Adding headers...")
-                # Checkbox sütunu için başlık da ekleyelim
-                self.sheet.insert_row(["site_id", "URL", "ff_site", "done or not"], index=1)
+            if not headers or headers[0] != "site_id":
+                logger.info("Headers missing. Inserting...")
+                self.sheet.insert_row(["site_id", "URL", "ff_site"], index=1)
         except Exception as e:
             logger.error(f"Error checking headers: {e}")
 
     def _load_existing_ids(self):
         """
-        MEVCUT DÜZENİ BOZMADAN OKUMA:
-        Sadece A sütunundaki ID'leri okur. Senin Checkboxlarına dokunmaz.
-        Regex kullanarak "361564.0", "361564" veya metin formatındaki ID'leri
-        tek bir formata (saf sayı stringi) çevirip hafızaya alır.
+        Gelişmiş ID Okuyucu:
+        Google Sheets'ten gelen veri ne kadar bozuk formatta olursa olsun (3.62E+8, 123.0, vb.)
+        içindeki gerçek tamsayı ID'yi regex ile söküp alır.
         """
         try:
-            # Sadece 1. sütunu (ID) çekiyoruz. Diğer sütunlar (Checkbox vs) umurumuzda değil.
-            col_a_values = self.sheet.col_values(1)
+            # col_values yerine get_all_values kullanarak tüm tabloyu garantiye alıyoruz
+            all_rows = self.sheet.get_all_values()
             
-            # Başlığı atla
-            if col_a_values:
-                col_a_values = col_a_values[1:]
+            # Başlık satırını atla (ilk satır)
+            if all_rows:
+                data_rows = all_rows[1:]
+            else:
+                data_rows = []
 
             count = 0
-            for val in col_a_values:
-                raw_val = str(val).strip()
+            for row in data_rows:
+                # Eğer satır boşsa atla
+                if not row: continue
+                
+                # A sütunu (ID) ilk elemandır
+                raw_val = str(row[0]).strip()
+                
                 if not raw_val: continue
 
-                # --- REGEX İLE SAF ID ÇIKARMA ---
-                # Ne gelirse gelsin (123.0, 123, site_id=123) içindeki sayıyı alır.
-                match = re.search(r'(\d+)', raw_val.replace(",", "").replace(".", ""))
+                # Regex ile sadece sayıları çek (En güvenli yöntem)
+                # "site_id=12345" -> "12345" bulur
+                # "12345.0" -> "12345" bulur
+                match = re.search(r'(\d+)', raw_val.replace(",", ""))
                 
                 if match:
-                    # Bulduğu sayıyı hafızaya atar
                     clean_id = match.group(1)
-                    # Çok önemli: Prisync ID'leri genelde 9 hanelidir. 
-                    # 123.0 gibi durumlarda sondaki 0'ı ID sanmaması için basit bir kontrol:
-                    # Ancak regex .replace(".", "") yaptığımız için 1230 olur.
-                    # Daha güvenli yöntem: float -> int -> str
-                    try:
-                        clean_id = str(int(float(raw_val)))
-                    except:
-                        pass # Regex sonucu zaten clean_id idi
-                    
                     self.existing_ids.add(clean_id)
                     count += 1
 
-            logger.info(f"✅ Loaded {len(self.existing_ids)} unique existing IDs (Scanning existing rows).")
+            logger.info(f"✅ Loaded {count} unique existing IDs (Regex Safe Mode).")
+            # Debug için ilk 3 ID'yi loga basalım ki doğru okuyor mu görelim
+            if self.existing_ids:
+                sample_ids = list(self.existing_ids)[:3]
+                logger.info(f"🔍 Sample IDs loaded: {sample_ids}")
+
         except Exception as e:
             logger.error(f"Error loading existing IDs: {e}")
-
-    def append_new_sites(self, rows_to_add):
-        """
-        Sadece yeni verileri EN ALTA ekler.
-        Mevcut satırlara, checkboxlara ASLA dokunmaz.
-        """
-        if rows_to_add:
-            try:
-                # append_rows fonksiyonu mevcut verinin en altına ekleme yapar.
-                self.sheet.append_rows(rows_to_add)
-                logger.info(f"✅ Appended {len(rows_to_add)} new rows to the bottom.")
-            except Exception as e:
-                logger.error(f"Error appending rows: {e}")
 
 class AsyncScraper:
     def __init__(self):
@@ -141,8 +124,10 @@ class AsyncScraper:
                     return await response.text()
                 elif response.status == 302:
                     logger.warning(f"Page {page_num} redirected. COOKIE MIGHT BE EXPIRED!")
-        except Exception:
-            pass
+                else:
+                    logger.warning(f"Page {page_num} failed: {response.status}")
+        except Exception as e:
+            logger.error(f"Error fetching page {page_num}: {e}")
         return None
 
     def parse_html(self, html):
@@ -186,27 +171,20 @@ class AsyncScraper:
                 tasks.append(task)
             await queue.join()
             for task in tasks: task.cancel()
+        
         return self.results
 
 class SlackNotifier:
     def __init__(self):
         self.webhook_url = os.environ.get("SLACK_WEBHOOK")
 
-    async def send_notification(self, new_rows):
-        if not self.webhook_url or not new_rows: return
+    async def send_notification(self, new_sites):
+        if not self.webhook_url: return
         try:
-            # new_rows format: [site_id, url, link]
-            count = len(new_rows)
-            # İlk 10 taneyi göster
-            display_rows = new_rows[:10]
+            message_text = f"🚨 *{len(new_sites)} Yeni Site Bulundu!* 🚨\n\n"
+            for site in new_sites:
+                message_text += f"• *{site[1]}* (ID: {site[0]})\n  <{site[2]}|Prisync Linki>\n"
             
-            message_text = f"🚨 *{count} Yeni Site Bulundu!* (Sona Eklendi) 🚨\n\n"
-            for row in display_rows:
-                message_text += f"• *{row[1]}* (ID: {row[0]})\n  <{row[2]}|Prisync Linki>\n"
-            
-            if count > 10:
-                message_text += f"\n... ve {count - 10} site daha."
-
             connector = aiohttp.TCPConnector(ssl=False)
             async with aiohttp.ClientSession(connector=connector) as session:
                 await session.post(self.webhook_url, json={"text": message_text})
@@ -215,46 +193,43 @@ class SlackNotifier:
             logger.error(f"Slack error: {e}")
 
 async def main():
-    # 1. Google Sheets Başlat
     sheets_manager = GoogleSheetsManager(SPREADSHEET_NAME)
     try:
         sheets_manager.connect()
     except Exception:
         return 
 
-    # 2. Scrape İşlemi
     logger.info("Starting scrape cycle...")
     scraper = AsyncScraper()
     found_sites = await scraper.run()
     logger.info(f"Scrape finished. Found {len(found_sites)} candidates.")
 
-    # 3. Filtreleme (Duplicate Killer)
-    rows_to_add = []
-    
-    # Prisync'ten gelenler ID'ye göre tersten (büyükten küçüğe) gelir genelde.
-    # Ama biz Sheet'in sonuna ekleyeceğimiz için sıralama çok dert değil.
-    # Yine de düzenli olsun diye ID'ye göre sıralayabiliriz.
-    found_sites.sort(key=lambda x: int(x['ID']) if str(x['ID']).isdigit() else 0, reverse=False)
-
-    for item in found_sites:
-        site_id = str(item['ID']).strip()
-        
-        # --- KRİTİK KONTROL ---
-        # Bot, sadece sheets_manager.existing_ids içinde OLMAYANLARI alır.
-        if site_id not in sheets_manager.existing_ids:
-            link = f"https://prisync.me/admin/fetchField/site?site_id={site_id}"
-            # [ID, URL, Link] formatında satır hazırla.
-            # Checkbox sütunu (D) boş kalacak, sen sonra tik atacaksın.
-            row = [site_id, item['Site'], link]
-            rows_to_add.append(row)
+    new_unique_sites = []
+    if found_sites:
+        found_sites.sort(key=lambda x: int(x['ID']) if str(x['ID']).isdigit() else 0, reverse=True)
+        rows_to_add = []
+        for item in found_sites:
+            site_id = str(item['ID']).strip()
             
-            # Aynı döngüde tekrar eklememek için hafızaya da ekle
-            sheets_manager.existing_ids.add(site_id)
-
-    # 4. Kaydetme ve Bildirim
-    if rows_to_add:
-        # Sadece yeni satırları EN ALTA ekle (Mevcutlara dokunma!)
-        sheets_manager.append_new_sites(rows_to_add)
+            if site_id not in sheets_manager.existing_ids:
+                link = f"https://prisync.me/admin/fetchField/site?site_id={site_id}"
+                row = [site_id, item['Site'], link]
+                rows_to_add.append(row)
+                sheets_manager.existing_ids.add(site_id)
         
-        # Slack'e bildir
+        if rows_to_add:
+            try:
+                sheets_manager.sheet.append_rows(rows_to_add)
+                new_unique_sites = rows_to_add
+                logger.info(f"Added {len(rows_to_add)} new sites.")
+            except Exception as e:
+                logger.error(f"Sheets error: {e}")
+        else:
+            logger.info("✅ No new unique sites found (Duplicate check passed).")
+
+    if new_unique_sites:
         slack = SlackNotifier()
+        await slack.send_notification(new_unique_sites)
+
+if __name__ == "__main__":
+    asyncio.run(main())
