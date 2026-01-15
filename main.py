@@ -34,7 +34,6 @@ class GoogleSheetsManager:
                 'https://www.googleapis.com/auth/spreadsheets',
                 'https://www.googleapis.com/auth/drive'
             ]
-            # GitHub Secret'tan gelen JSON verisini okuyoruz
             json_creds = json.loads(os.environ["GSPREAD_JSON"])
             creds = Credentials.from_service_account_info(json_creds, scopes=scopes)
             self.client = gspread.authorize(creds)
@@ -57,50 +56,51 @@ class GoogleSheetsManager:
 
     def _load_existing_ids(self):
         """
-        GÜÇLENDİRİLMİŞ OKUMA:
-        Google Sheets'ten gelen veriyi (Sayı, Metin, Noktalı Sayı) ne olursa olsun
-        temiz bir String ID'ye çevirir. Duplicate sorununu çözer.
+        Gelişmiş ID Okuyucu:
+        Google Sheets'ten gelen veri ne kadar bozuk formatta olursa olsun (3.62E+8, 123.0, vb.)
+        içindeki gerçek tamsayı ID'yi regex ile söküp alır.
         """
         try:
-            # Sadece A sütununu (ID'leri) çekiyoruz
-            col_a_values = self.sheet.col_values(1)
+            # col_values yerine get_all_values kullanarak tüm tabloyu garantiye alıyoruz
+            all_rows = self.sheet.get_all_values()
             
-            for val in col_a_values:
-                raw_val = str(val).strip()
-                if not raw_val: 
-                    continue
-                
-                clean_id = None
-                try:
-                    # 1. Adım: Virgülleri temizle (Binlik ayracı varsa)
-                    raw_val = raw_val.replace(",", "")
-                    
-                    # 2. Adım: Önce Float yap (3615.0 gibi gelirse hata vermesin)
-                    val_float = float(raw_val)
-                    
-                    # 3. Adım: Int yap (Küsuratı at: 3615.0 -> 3615)
-                    val_int = int(val_float)
-                    
-                    # 4. Adım: String yap ve kaydet
-                    clean_id = str(val_int)
-                    
-                except ValueError:
-                    # Eğer matematiksel sayı değilse (örn: URL veya Metin karışmışsa)
-                    # İçindeki ilk sayı grubunu bulmaya çalış
-                    match = re.search(r'(\d+)', raw_val)
-                    if match:
-                        clean_id = match.group(1)
-                
-                if clean_id:
-                    self.existing_ids.add(clean_id)
+            # Başlık satırını atla (ilk satır)
+            if all_rows:
+                data_rows = all_rows[1:]
+            else:
+                data_rows = []
 
-            logger.info(f"Loaded {len(self.existing_ids)} unique existing IDs (Robust Clean).")
+            count = 0
+            for row in data_rows:
+                # Eğer satır boşsa atla
+                if not row: continue
+                
+                # A sütunu (ID) ilk elemandır
+                raw_val = str(row[0]).strip()
+                
+                if not raw_val: continue
+
+                # Regex ile sadece sayıları çek (En güvenli yöntem)
+                # "site_id=12345" -> "12345" bulur
+                # "12345.0" -> "12345" bulur
+                match = re.search(r'(\d+)', raw_val.replace(",", ""))
+                
+                if match:
+                    clean_id = match.group(1)
+                    self.existing_ids.add(clean_id)
+                    count += 1
+
+            logger.info(f"✅ Loaded {count} unique existing IDs (Regex Safe Mode).")
+            # Debug için ilk 3 ID'yi loga basalım ki doğru okuyor mu görelim
+            if self.existing_ids:
+                sample_ids = list(self.existing_ids)[:3]
+                logger.info(f"🔍 Sample IDs loaded: {sample_ids}")
+
         except Exception as e:
             logger.error(f"Error loading existing IDs: {e}")
 
 class AsyncScraper:
     def __init__(self):
-        # Cookie stringini direkt GitHub Secret'tan alıp parse ediyoruz
         raw_cookie = os.environ.get("PRISYNC_COOKIE", "")
         self.cookies = {}
         if raw_cookie:
@@ -139,7 +139,7 @@ class AsyncScraper:
                 cols = row.find_all("td")
                 if len(cols) >= 3:
                     seller_name = cols[2].get_text(strip=True)
-                    if not seller_name: # Boş satıcı (Fetch Field)
+                    if not seller_name: 
                         site_id = cols[0].get_text(strip=True)
                         site_url = cols[1].get_text(strip=True)
                         data.append({"ID": site_id, "Site": site_url})
@@ -193,20 +193,17 @@ class SlackNotifier:
             logger.error(f"Slack error: {e}")
 
 async def main():
-    # 1. Google Sheets Başlat
     sheets_manager = GoogleSheetsManager(SPREADSHEET_NAME)
     try:
         sheets_manager.connect()
     except Exception:
         return 
 
-    # 2. Scrape İşlemi
     logger.info("Starting scrape cycle...")
     scraper = AsyncScraper()
     found_sites = await scraper.run()
     logger.info(f"Scrape finished. Found {len(found_sites)} candidates.")
 
-    # 3. Filtreleme ve Kayıt
     new_unique_sites = []
     if found_sites:
         found_sites.sort(key=lambda x: int(x['ID']) if str(x['ID']).isdigit() else 0, reverse=True)
@@ -214,12 +211,11 @@ async def main():
         for item in found_sites:
             site_id = str(item['ID']).strip()
             
-            # --- GÜVENLİ KONTROL ---
             if site_id not in sheets_manager.existing_ids:
                 link = f"https://prisync.me/admin/fetchField/site?site_id={site_id}"
                 row = [site_id, item['Site'], link]
                 rows_to_add.append(row)
-                sheets_manager.existing_ids.add(site_id) # Set'e ekle ki aynı turda tekrar eklemesin
+                sheets_manager.existing_ids.add(site_id)
         
         if rows_to_add:
             try:
@@ -228,8 +224,9 @@ async def main():
                 logger.info(f"Added {len(rows_to_add)} new sites.")
             except Exception as e:
                 logger.error(f"Sheets error: {e}")
+        else:
+            logger.info("✅ No new unique sites found (Duplicate check passed).")
 
-    # 4. Slack Bildirimi
     if new_unique_sites:
         slack = SlackNotifier()
         await slack.send_notification(new_unique_sites)
