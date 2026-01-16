@@ -3,7 +3,6 @@ name: Prisync Scraper Bot
 on:
   schedule:
     - cron: '*/5 * * * *'  # 6 dakikada bir çalış
-  workflow_dispatch:      # Manuel buton
 
 
 concurrency:
