@@ -2,7 +2,7 @@ name: Prisync Scraper Bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/8 * * * *'
 
 concurrency:
   group: prisync-scraper-bot
